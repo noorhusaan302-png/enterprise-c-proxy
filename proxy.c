@@ -15,19 +15,34 @@
 #include <signal.h>
 #include <strings.h>
 
-#define BACKLOG 32
+#include <errno.h>
+
+#define BACKLOG 128
 #define BUFFER_SIZE 8192
 #define MAX_CACHE_SIZE 5
-#define CACHE_TTL 60
-#define POOL_TIMEOUT 30 // Seconds idle before closing pooled socket
+#define CACHE_TTL 60     // Seconds a cached response stays valid
+#define POOL_TIMEOUT 30  // Seconds idle before closing pooled socket
 
 // Rate Limiting Constants
 #define MAX_TOKENS 10.0
-#define REFILL_RATE 2.0 // Tokens per second
+#define REFILL_RATE 2.0  // Tokens per second
+
+// Worker Thread Pool Constants
+#define NUM_WORKERS 32
+#define QUEUE_CAPACITY 1024
+
+// Runtime settings: default to the constants above, and can be overridden with
+// environment variables (used by the test suite and the benchmark)
+static int cache_ttl = CACHE_TTL;
+static double max_tokens = MAX_TOKENS;
+static double refill_rate = REFILL_RATE;
 
 // Global Metrics Trackers
+time_t start_time;
 long total_requests = 0;
 long cache_hits = 0;
+long cache_misses = 0;
+long active_connections = 0;
 long blocked_requests = 0;
 long rate_limited_requests = 0;
 long total_bytes_proxied = 0;
@@ -38,7 +53,7 @@ pthread_mutex_t metrics_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct RateLimitNode {
     char ip[INET_ADDRSTRLEN];
     double tokens;
-    time_t last_update;
+    double last_update;
     struct RateLimitNode *next;
 } RateLimitNode;
 
@@ -59,7 +74,7 @@ pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Cache Node Structure
 typedef struct CacheNode {
-    char url[1024];
+    char url[1300];
     char *response;
     size_t response_len;
     time_t timestamp;
@@ -97,10 +112,19 @@ void load_blacklist() {
     }
 }
 
+// Blocks an exact match ("example.com") and any subdomain of a listed domain
+// ("ads.example.com"), but not unrelated names that merely end the same way
+// ("notexample.com")
 int is_blacklisted(const char *host) {
+    size_t hlen = strlen(host);
     pthread_mutex_lock(&blacklist_lock);
     for (int i = 0; i < blacklist_count; i++) {
-        if (strcasecmp(blacklist[i], host) == 0) {
+        size_t blen = strlen(blacklist[i]);
+        int exact = (strcasecmp(blacklist[i], host) == 0);
+        int subdomain = (hlen > blen &&
+                         host[hlen - blen - 1] == '.' &&
+                         strcasecmp(host + hlen - blen, blacklist[i]) == 0);
+        if (exact || subdomain) {
             pthread_mutex_unlock(&blacklist_lock);
             return 1;
         }
@@ -110,16 +134,22 @@ int is_blacklisted(const char *host) {
 }
 
 // Token Bucket Rate Limiting Check
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 int check_rate_limit(const char *ip) {
     pthread_mutex_lock(&rl_lock);
-    time_t now = time(NULL);
+    double now = now_seconds();
     RateLimitNode *curr = rl_head;
 
     while (curr != NULL) {
         if (strcmp(curr->ip, ip) == 0) {
-            double elapsed = difftime(now, curr->last_update);
-            curr->tokens += elapsed * REFILL_RATE;
-            if (curr->tokens > MAX_TOKENS) curr->tokens = MAX_TOKENS;
+            double elapsed = now - curr->last_update;
+            curr->tokens += elapsed * refill_rate;
+            if (curr->tokens > max_tokens) curr->tokens = max_tokens;
             curr->last_update = now;
 
             if (curr->tokens >= 1.0) {
@@ -137,7 +167,7 @@ int check_rate_limit(const char *ip) {
     // New IP entry
     RateLimitNode *new_node = malloc(sizeof(RateLimitNode));
     snprintf(new_node->ip, sizeof(new_node->ip), "%s", ip);
-    new_node->tokens = MAX_TOKENS - 1.0;
+    new_node->tokens = max_tokens - 1.0;
     new_node->last_update = now;
     new_node->next = rl_head;
     rl_head = new_node;
@@ -206,7 +236,7 @@ int cache_get(const char *url, char **response, size_t *response_len) {
 
     while (curr != NULL) {
         if (strcmp(curr->url, url) == 0) {
-            if (difftime(now, curr->timestamp) > CACHE_TTL) {
+            if (difftime(now, curr->timestamp) >= cache_ttl) {
                 if (prev) prev->next = curr->next;
                 else cache_head = curr->next;
                 free(curr->response);
@@ -373,11 +403,7 @@ static size_t relay_response(int remote, int client, int is_head,
     return total;
 }
 
-void *handle_client(void *client_socket_ptr) {
-    int client_socket = *(int *)client_socket_ptr;
-    free(client_socket_ptr);
-    pthread_detach(pthread_self());
-
+void *handle_client(int client_socket) {
     // Extract client IP address for Rate Limiting
     struct sockaddr_in peer_addr;
     socklen_t peer_len = sizeof(peer_addr);
@@ -413,18 +439,34 @@ void *handle_client(void *client_socket_ptr) {
     // Check for internal /stats endpoint request
     if (strstr(buffer, "GET /stats") != NULL) {
         pthread_mutex_lock(&metrics_lock);
-        char stats_body[512];
+        long uptime = (long)difftime(time(NULL), start_time);
+        double bandwidth = uptime > 0 ? (double)total_bytes_proxied / (double)uptime
+                                      : (double)total_bytes_proxied;
+        char stats_body[1024];
         int body_len = snprintf(stats_body, sizeof(stats_body),
-            "{\n  \"total_requests\": %ld,\n  \"cache_hits\": %ld,\n  \"blocked_requests\": %ld,\n  \"rate_limited_requests\": %ld,\n  \"pooled_connections_reused\": %ld,\n  \"total_bytes_proxied\": %ld\n}\n",
-            total_requests, cache_hits, blocked_requests, rate_limited_requests, pooled_connections_reused, total_bytes_proxied);
+            "{\n"
+            "  \"uptime_seconds\": %ld,\n"
+            "  \"active_connections\": %ld,\n"
+            "  \"total_requests\": %ld,\n"
+            "  \"cache_hits\": %ld,\n"
+            "  \"cache_misses\": %ld,\n"
+            "  \"blocked_requests\": %ld,\n"
+            "  \"rate_limited_requests\": %ld,\n"
+            "  \"pooled_connections_reused\": %ld,\n"
+            "  \"total_bytes_proxied\": %ld,\n"
+            "  \"bandwidth_bytes_per_sec\": %.1f\n"
+            "}\n",
+            uptime, active_connections, total_requests, cache_hits, cache_misses,
+            blocked_requests, rate_limited_requests, pooled_connections_reused,
+            total_bytes_proxied, bandwidth);
         pthread_mutex_unlock(&metrics_lock);
 
         char header[256];
         int header_len = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", body_len);
 
-        write(client_socket, header, header_len);
-        write(client_socket, stats_body, body_len);
+        write_all(client_socket, header, (size_t)header_len);
+        write_all(client_socket, stats_body, (size_t)body_len);
         close(client_socket);
         return NULL;
     }
@@ -477,7 +519,7 @@ void *handle_client(void *client_socket_ptr) {
 
         if (getaddrinfo(target_host, port_str, &hints, &res) != 0) {
             char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
-            write(client_socket, err, strlen(err));
+            write_all(client_socket, err, strlen(err));
             close(client_socket);
             return NULL;
         }
@@ -485,7 +527,7 @@ void *handle_client(void *client_socket_ptr) {
         int remote_socket = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (remote_socket < 0 || connect(remote_socket, res->ai_addr, res->ai_addrlen) < 0) {
             char *err = "HTTP/1.1 502 Bad Gateway\r\n\r\n";
-            write(client_socket, err, strlen(err));
+            write_all(client_socket, err, strlen(err));
             if (remote_socket >= 0) close(remote_socket);
             freeaddrinfo(res);
             close(client_socket);
@@ -494,7 +536,7 @@ void *handle_client(void *client_socket_ptr) {
         freeaddrinfo(res);
 
         char *ok_msg = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        write(client_socket, ok_msg, strlen(ok_msg));
+        write_all(client_socket, ok_msg, strlen(ok_msg));
 
         int kq = kqueue();
         struct kevent ev[2];
@@ -511,11 +553,11 @@ void *handle_client(void *client_socket_ptr) {
                 if (fd == client_socket) {
                     int n = read(client_socket, buffer, BUFFER_SIZE);
                     if (n <= 0) goto tunnel_end;
-                    write(remote_socket, buffer, n);
+                    if (write_all(remote_socket, buffer, (size_t)n) < 0) goto tunnel_end;
                 } else if (fd == remote_socket) {
                     int n = read(remote_socket, buffer, BUFFER_SIZE);
                     if (n <= 0) goto tunnel_end;
-                    write(client_socket, buffer, n);
+                    if (write_all(client_socket, buffer, (size_t)n) < 0) goto tunnel_end;
                 }
             }
         }
@@ -530,7 +572,7 @@ void *handle_client(void *client_socket_ptr) {
     char method[16] = "";
     char path[1024] = "/";
     sscanf(buffer, "%15s %1023s", method, path);
-    char cache_key[1024];
+    char cache_key[1300];
     snprintf(cache_key, sizeof(cache_key), "%s:%d%s", target_host, target_port, path);
     int cacheable = (strcmp(method, "GET") == 0);
 
@@ -546,6 +588,11 @@ void *handle_client(void *client_socket_ptr) {
         free(cached_response);
         close(client_socket);
         return NULL;
+    }
+    if (cacheable) {
+        pthread_mutex_lock(&metrics_lock);
+        cache_misses++;
+        pthread_mutex_unlock(&metrics_lock);
     }
 
     // Header Injection: add X-Proxied-By as its own header line
@@ -620,6 +667,81 @@ void *handle_client(void *client_socket_ptr) {
     return NULL;
 }
 
+// ---------------------------------------------------------------------------
+// Worker thread pool
+//
+// The main thread runs a kqueue event loop on the non-blocking listening socket
+// and accepts connections as they become ready. Accepted sockets are pushed onto
+// a bounded queue; a fixed pool of worker threads pops them off and serves them.
+// The queue is protected by a mutex and two condition variables: workers sleep
+// on `not_empty` when there is nothing to do, and the accept loop waits on
+// `not_full` if every worker is busy and the queue is full.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int fds[QUEUE_CAPACITY];
+    int head, tail, count;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} WorkQueue;
+
+static WorkQueue work_queue = {
+    .head = 0, .tail = 0, .count = 0,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .not_empty = PTHREAD_COND_INITIALIZER,
+    .not_full = PTHREAD_COND_INITIALIZER,
+};
+
+static void queue_push(WorkQueue *q, int fd) {
+    pthread_mutex_lock(&q->lock);
+    while (q->count == QUEUE_CAPACITY) {
+        pthread_cond_wait(&q->not_full, &q->lock);
+    }
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1) % QUEUE_CAPACITY;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+}
+
+static int queue_pop(WorkQueue *q) {
+    pthread_mutex_lock(&q->lock);
+    while (q->count == 0) {
+        pthread_cond_wait(&q->not_empty, &q->lock);
+    }
+    int fd = q->fds[q->head];
+    q->head = (q->head + 1) % QUEUE_CAPACITY;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->lock);
+    return fd;
+}
+
+static void *worker_main(void *arg) {
+    (void)arg;
+    while (1) {
+        int client_socket = queue_pop(&work_queue);
+
+        pthread_mutex_lock(&metrics_lock);
+        active_connections++;
+        pthread_mutex_unlock(&metrics_lock);
+
+        handle_client(client_socket);
+
+        pthread_mutex_lock(&metrics_lock);
+        active_connections--;
+        pthread_mutex_unlock(&metrics_lock);
+    }
+    return NULL;
+}
+
+static void load_settings_from_env(void) {
+    const char *v;
+    if ((v = getenv("PROXY_CACHE_TTL")) != NULL) cache_ttl = atoi(v);
+    if ((v = getenv("PROXY_MAX_TOKENS")) != NULL) max_tokens = atof(v);
+    if ((v = getenv("PROXY_REFILL_RATE")) != NULL) refill_rate = atof(v);
+}
+
 int main(int argc, char *argv[]) {
     int port = 8080;
     if (argc > 1) {
@@ -627,6 +749,9 @@ int main(int argc, char *argv[]) {
     }
 
     signal(SIGPIPE, SIG_IGN); // a closed peer must not kill the whole proxy
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    start_time = time(NULL);
+    load_settings_from_env();
     load_blacklist();
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -639,6 +764,7 @@ int main(int argc, char *argv[]) {
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
@@ -653,6 +779,21 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Non-blocking listening socket: the event loop drains every pending
+    // connection on each wakeup and never blocks inside accept()
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+    // Start the worker thread pool
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, worker_main, NULL) != 0) {
+            perror("pthread_create failed");
+            exit(EXIT_FAILURE);
+        }
+        pthread_detach(tid);
+    }
+
     int kq = kqueue();
     if (kq < 0) {
         perror("kqueue failed");
@@ -661,29 +802,34 @@ int main(int argc, char *argv[]) {
 
     struct kevent change;
     EV_SET(&change, server_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    kevent(kq, &change, 1, NULL, 0, NULL);
+    if (kevent(kq, &change, 1, NULL, 0, NULL) < 0) {
+        perror("kevent register failed");
+        exit(EXIT_FAILURE);
+    }
 
-    printf("Enterprise Rate-Limited Proxy Server listening on port %d...\n", port);
+    printf("Enterprise Rate-Limited Proxy Server listening on port %d (%d workers)...\n",
+           port, NUM_WORKERS);
 
     struct kevent event;
     while (1) {
         int nev = kevent(kq, NULL, 0, &event, 1, NULL);
-        if (nev < 0) continue;
+        if (nev <= 0) continue;
+        if ((int)event.ident != server_fd) continue;
 
-        if ((int)event.ident == server_fd) {
+        // Accept everything that is ready, then go back to waiting on kqueue
+        while (1) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int *client_socket = malloc(sizeof(int));
-            if ((*client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) < 0) {
-                free(client_socket);
-                continue;
+            int client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+            if (client_socket < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                break;
             }
-
-            pthread_t thread_id;
-            if (pthread_create(&thread_id, NULL, handle_client, (void *)client_socket) != 0) {
-                close(*client_socket);
-                free(client_socket);
-            }
+            // Worker threads use blocking I/O on their own client socket
+            int cflags = fcntl(client_socket, F_GETFL, 0);
+            fcntl(client_socket, F_SETFL, cflags & ~O_NONBLOCK);
+            queue_push(&work_queue, client_socket);
         }
     }
 
