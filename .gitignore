@@ -1,1 +1,4 @@
 proxy
+proxy-asan
+proxy-tsan
+__pycache__/
